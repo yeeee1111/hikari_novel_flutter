@@ -30,15 +30,16 @@ jobs:
         run: |
           ls -d /Applications/Xcode*.app 2>/dev/null || true
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)
-          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer"
+          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer" || true
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version || true
 
       # Rust 工具链：Cargokit 通过 podspec 的 script phase 编出 libhikari_http.a
+      # 注意：不装 Homebrew llvm（太慢且常失败），libclang 直接用 Xcode 自带的
       - name: Install Rust + native deps
         run: |
           set -euo pipefail
-          brew install cmake nasm llvm || true
+          brew install cmake nasm || true
           if ! command -v rustup >/dev/null 2>&1; then
             brew install rustup-init
             rustup-init -y --no-modify-path
@@ -52,10 +53,12 @@ jobs:
 
       - name: Export Rust/CocoaPods env
         run: |
-          {
-            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"
-            echo "RUST_BACKTRACE=1"
-          } >> "$GITHUB_ENV"
+          LIBCLANG="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
+          echo '--- libclang 自检 ---'
+          echo "LIBCLANG_PATH=$LIBCLANG"
+          ls -la "$LIBCLANG" | grep -i clang | head -n 5 || echo '找不到 libclang！'
 
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
