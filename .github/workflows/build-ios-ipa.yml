@@ -1,0 +1,109 @@
+name: Build unsigned IPA
+
+# 用途：在 GitHub 的 macOS 云机器上把 hikari_novel_flutter 编成未签名 .ipa
+# 用法：放到 fork 的仓库里，路径 .github/workflows/build-ios-ipa.yml
+#      提交后自动触发，或到 Actions 页面点 "Run workflow"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    # 若提示 macos-14 不可用，改成 macos-15
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner / Xcode info
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+
+      # 本仓库 pubspec 要求 sdk ^3.12.2，必须用最新 stable（自带 Dart 3.12+）
+      # 所以这里不写死 flutter-version
+      - name: Setup Flutter (latest stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: |
+          flutter --version
+          dart --version
+          flutter doctor -v
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      # 注意：不要单独跑 pod install，flutter build ios 会自动处理
+      - name: Print bundle identifiers
+        run: |
+          grep -o 'PRODUCT_BUNDLE_IDENTIFIER = [^;]*' ios/Runner.xcodeproj/project.pbxproj | sort -u
+
+      - name: Build iOS (no codesign)
+        run: flutter build ios --release --no-codesign
+
+      # 打包成未签名 IPA，并用 ditto 保证结构干净（无 __MACOSX）
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+
+          echo '--- 二进制架构（真机必须是 arm64）---'
+          lipo -info "$APP/Runner" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
+
+          rm -rf Payload hikari-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          # 清掉 Finder/压缩工具的元数据
+          xattr -cr Payload || true
+          find Payload -name '.DS_Store' -delete || true
+
+          # 与可用的未签名 IPA 对齐：UIRequiredDeviceCapabilities = [arm64]
+          # 先 Delete 再 Add，避免变成 ['arm64','arm64']
+          P="Payload/Runner.app/Info.plist"
+          /usr/libexec/PlistBuddy -c "Delete :UIRequiredDeviceCapabilities" "$P" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities array" "$P"
+          /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities:0 string arm64" "$P"
+
+          echo '--- 最终 Info.plist 关键字段 ---'
+          for k in CFBundleIdentifier CFBundleExecutable CFBundleDisplayName CFBundleShortVersionString \
+                   CFBundleVersion MinimumOSVersion UIRequiredDeviceCapabilities DTPlatformName; do
+            printf '%-32s ' "$k"
+            /usr/libexec/PlistBuddy -c "Print :$k" "$P" 2>/dev/null | tr '\n' ' ' ; echo
+          done
+
+          ditto -c -k --sequesterRsrc --keepParent Payload hikari-unsigned.ipa
+          rm -rf Payload
+
+          echo '--- 产物结构检查 ---'
+          ls -lh hikari-unsigned.ipa
+          unzip -l hikari-unsigned.ipa | head -n 15
+          if unzip -l hikari-unsigned.ipa | grep -q '__MACOSX'; then
+            echo 'WARN: IPA 内含 __MACOSX'
+          else
+            echo 'OK: 结构干净，无 __MACOSX'
+          fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hikari-unsigned-ipa
+          path: hikari-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
