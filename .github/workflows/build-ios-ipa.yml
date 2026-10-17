@@ -1,11 +1,8 @@
-name: Build unsigned IPA
+name: Build unsigned IPA (cloudflare bypass branch)
 
-# 用途：在 GitHub 的 macOS 云机器上把 hikari_novel_flutter 编成未签名 .ipa
-# 用法：放到 fork 的仓库里，路径 .github/workflows/build-ios-ipa.yml
-#      提交后自动触发，或到 Actions 页面点 "Run workflow"
-#
-# v2 变更：device_info_plus 13.3.0 用了 iOS 26 的 isiOSAppOnVision，
-#          必须用带 Xcode 26 的镜像（macos-15+），并显式选中最新的 Xcode
+# 构建上游 refactor/cloudflare_bypass 分支：
+# 该分支用 Rust(wreq) 模拟 Chrome 136 的 TLS 指纹，绕过 wenku8 前面的 Cloudflare 拦截
+# 放在你 fork 的 main 分支的 .github/workflows/build-ios-ipa.yml 里即可（checkout 时直接拉上游分支）
 
 on:
   workflow_dispatch:
@@ -13,35 +10,53 @@ on:
     branches: [main, master]
 
 concurrency:
-  group: ipa-${{ github.ref }}
+  group: ipa-cf-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-ipa:
-    # macos-14 只有 Xcode 16/SDK 18，装不了 Xcode 26；必须用更新镜像
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout
+      - name: Checkout upstream bypass branch
         uses: actions/checkout@v4
+        with:
+          repository: 15dd/hikari_novel_flutter
+          ref: refactor/cloudflare_bypass
+          fetch-depth: 1
 
       - name: Select newest Xcode
         run: |
-          echo '--- 可用 Xcode ---'
           ls -d /Applications/Xcode*.app 2>/dev/null || true
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)
-          if [ -n "$NEWEST" ]; then
-            echo "选中: $NEWEST"
-            sudo xcode-select -s "$NEWEST/Contents/Developer"
-          fi
-          echo '--- 当前生效 ---'
-          xcode-select -p
+          [ -n "$NEWEST" ] && sudo xcode-select -s "$NEWEST/Contents/Developer"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version || true
-          sw_vers
 
-      # 本仓库 pubspec 要求 sdk ^3.12.2，必须用最新 stable（自带 Dart 3.12+）
+      # Rust 工具链：Cargokit 通过 podspec 的 script phase 编出 libhikari_http.a
+      - name: Install Rust + native deps
+        run: |
+          set -euo pipefail
+          brew install cmake nasm llvm || true
+          if ! command -v rustup >/dev/null 2>&1; then
+            brew install rustup-init
+            rustup-init -y --no-modify-path
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-apple-ios
+          cargo --version
+          rustc --version
+          rustup target list --installed
+
+      - name: Export Rust/CocoaPods env
+        run: |
+          {
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"
+            echo "RUST_BACKTRACE=1"
+          } >> "$GITHUB_ENV"
+
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
         with:
@@ -52,69 +67,57 @@ jobs:
         run: |
           flutter --version
           dart --version
-          flutter doctor -v
+          cargo --version
 
       - name: flutter pub get
         run: flutter pub get
 
-      # 注意：不要单独跑 pod install，flutter build ios 会自动处理
-      - name: Print bundle identifiers
-        run: |
-          grep -o 'PRODUCT_BUNDLE_IDENTIFIER = [^;]*' ios/Runner.xcodeproj/project.pbxproj | sort -u
-
+      # 真实耗时在这里：Rust 侧要编译 BoringSSL + wreq，首次很慢（10-25 分钟）
       - name: Build iOS (no codesign)
-        run: flutter build ios --release --no-codesign
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -o pipefail
+          cargo --version || true
+          flutter build ios --release --no-codesign 2>&1 | tee build-ios.log
 
-      # 打包成未签名 IPA，并用 ditto 保证结构干净（无 __MACOSX）
       - name: Package unsigned IPA
+        if: always()
         run: |
           set -euo pipefail
           APP="build/ios/iphoneos/Runner.app"
-          test -d "$APP"
+          if [ ! -d "$APP" ]; then
+            echo '构建未产出 Runner.app'
+            ls -la build/ios 2>/dev/null || true
+            exit 1
+          fi
 
-          echo '--- 二进制架构（真机必须是 arm64）---'
           lipo -info "$APP/Runner" || true
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
           /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
 
-          rm -rf Payload hikari-unsigned.ipa
+          rm -rf Payload hikari-cf-unsigned.ipa
           mkdir -p Payload
           cp -R "$APP" Payload/
-
-          # 清掉 Finder/压缩工具的元数据
           xattr -cr Payload || true
           find Payload -name '.DS_Store' -delete || true
 
-          # 与可用的未签名 IPA 对齐：UIRequiredDeviceCapabilities = [arm64]
-          # 先 Delete 再 Add，避免变成 ['arm64','arm64']
           P="Payload/Runner.app/Info.plist"
           /usr/libexec/PlistBuddy -c "Delete :UIRequiredDeviceCapabilities" "$P" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities array" "$P"
           /usr/libexec/PlistBuddy -c "Add :UIRequiredDeviceCapabilities:0 string arm64" "$P"
 
-          echo '--- 最终 Info.plist 关键字段 ---'
-          for k in CFBundleIdentifier CFBundleExecutable CFBundleDisplayName CFBundleShortVersionString \
-                   CFBundleVersion MinimumOSVersion UIRequiredDeviceCapabilities DTPlatformName; do
-            printf '%-32s ' "$k"
-            /usr/libexec/PlistBuddy -c "Print :$k" "$P" 2>/dev/null | tr '\n' ' ' ; echo
-          done
-
-          ditto -c -k --sequesterRsrc --keepParent Payload hikari-unsigned.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload hikari-cf-unsigned.ipa
           rm -rf Payload
-
-          echo '--- 产物结构检查 ---'
-          ls -lh hikari-unsigned.ipa
-          unzip -l hikari-unsigned.ipa | head -n 15
-          if unzip -l hikari-unsigned.ipa | grep -q '__MACOSX'; then
-            echo 'WARN: IPA 内含 __MACOSX'
-          else
-            echo 'OK: 结构干净，无 __MACOSX'
-          fi
+          ls -lh hikari-cf-unsigned.ipa
 
       - name: Upload IPA artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hikari-unsigned-ipa
-          path: hikari-unsigned.ipa
-          if-no-files-found: error
+          name: hikari-cf-unsigned-ipa
+          path: |
+            hikari-cf-unsigned.ipa
+            build-ios.log
+          if-no-files-found: warn
           retention-days: 30
