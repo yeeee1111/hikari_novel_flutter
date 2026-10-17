@@ -1,7 +1,8 @@
 name: Build unsigned IPA (cloudflare bypass branch)
 
 # 构建上游 refactor/cloudflare_bypass 分支（Rust wreq 模拟 Chrome TLS 指纹，绕过 Cloudflare）
-# 放在 fork 的 main 分支的 .github/workflows/build-ios-ipa.yml 里，checkout 时直接拉上游分支
+# 关键修法：libc 0.2.190 删除了 iOS 的 _dyld_* 绑定，导致 backtrace 0.3.76 编译失败
+#           这里把 libc 钉回旧版本再编
 
 on:
   workflow_dispatch:
@@ -33,8 +34,6 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version || true
 
-      # Rust 工具链：Cargokit 通过 podspec 的 script phase 编出 libhikari_http.a
-      # 不装 Homebrew llvm（太慢），libclang 用 Xcode 自带的
       - name: Install Rust + native deps
         run: |
           set -euo pipefail
@@ -49,7 +48,6 @@ jobs:
           echo '--- 工具链版本 ---'
           cargo --version
           rustc --version
-          rustup show
           rustup target list --installed
 
       - name: Export Rust env
@@ -57,8 +55,6 @@ jobs:
           LIBCLANG="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib"
           echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
           echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
-          echo '--- libclang 自检 ---'
-          ls -la "$LIBCLANG" | grep -i clang | head -n 5 || echo '找不到 libclang'
 
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
@@ -74,15 +70,40 @@ jobs:
       - name: flutter pub get
         run: flutter pub get
 
-      # 诊断步骤：单独编 Rust，把完整 rustc 错误写进 cargo-build.log
-      # 失败也继续（continue-on-error），保证后面的 flutter build 和日志上传都会发生
+      # 修复依赖漂移：libc 0.2.190 移除了 iOS 的 _dyld_* 绑定，backtrace 0.3.76 因此编不过
+      # 从一个较旧的版本往回找，取第一个能被 cargo 接受（满足所有约束）的版本
+      - name: Pin libc for backtrace (workaround)
+        run: |
+          set -euo pipefail
+          if [ ! -d rust ]; then echo '没有 rust 目录，跳过'; exit 0; fi
+          cd rust
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+
+          echo '--- 修改前 ---'
+          grep -A1 'name = "libc"' Cargo.lock | head -n 4 || true
+
+          PINNED=""
+          for v in 0.2.150 0.2.155 0.2.160 0.2.165 0.2.170 0.2.175 0.2.180 0.2.185 0.2.189; do
+            if cargo update -p libc --precise "$v" >/dev/null 2>&1; then
+              PINNED="$v"
+              break
+            fi
+          done
+
+          echo "--- 结果 ---"
+          if [ -n "$PINNED" ]; then
+            echo "libc 已钉到 $PINNED"
+          else
+            echo '全部版本都失败，保持原样'
+          fi
+          grep -A1 'name = "libc"' Cargo.lock | head -n 4 || true
+
       - name: Prebuild Rust (diagnostic)
         continue-on-error: true
         run: |
           set -euo pipefail
           if [ ! -d rust ]; then echo '没有 rust 目录'; exit 0; fi
           cd rust
-          ls -la
           echo '--- cargo build start ---'
           cargo build --release --target aarch64-apple-ios 2>&1 | tee ../cargo-build.log | tail -n 200
           echo '--- cargo build ok ---'
