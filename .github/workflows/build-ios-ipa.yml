@@ -3,6 +3,9 @@ name: Build unsigned IPA
 # 用途：在 GitHub 的 macOS 云机器上把 hikari_novel_flutter 编成未签名 .ipa
 # 用法：放到 fork 的仓库里，路径 .github/workflows/build-ios-ipa.yml
 #      提交后自动触发，或到 Actions 页面点 "Run workflow"
+#
+# v2 变更：device_info_plus 13.3.0 用了 iOS 26 的 isiOSAppOnVision，
+#          必须用带 Xcode 26 的镜像（macos-15+），并显式选中最新的 Xcode
 
 on:
   workflow_dispatch:
@@ -15,22 +18,30 @@ concurrency:
 
 jobs:
   build-ipa:
-    # 若提示 macos-14 不可用，改成 macos-15
-    runs-on: macos-14
+    # macos-14 只有 Xcode 16/SDK 18，装不了 Xcode 26；必须用更新镜像
+    runs-on: macos-latest
     timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show runner / Xcode info
+      - name: Select newest Xcode
         run: |
-          sw_vers
-          xcodebuild -version
+          echo '--- 可用 Xcode ---'
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n1)
+          if [ -n "$NEWEST" ]; then
+            echo "选中: $NEWEST"
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+          fi
+          echo '--- 当前生效 ---'
           xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || true
+          sw_vers
 
       # 本仓库 pubspec 要求 sdk ^3.12.2，必须用最新 stable（自带 Dart 3.12+）
-      # 所以这里不写死 flutter-version
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
         with:
