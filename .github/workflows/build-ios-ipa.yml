@@ -1,8 +1,11 @@
 name: Build unsigned IPA (cloudflare bypass branch)
 
 # 构建上游 refactor/cloudflare_bypass 分支（Rust wreq 模拟 Chrome TLS 指纹，绕过 Cloudflare）
-# 关键修法：libc 0.2.190 删除了 iOS 的 _dyld_* 绑定，导致 backtrace 0.3.76 编译失败
-#           这里把 libc 钉回旧版本再编
+#
+# 已修的上游问题：
+#   1) libc 0.2.190 删除 iOS 的 _dyld_* → backtrace 0.3.76 编不过  → 钉回旧版 libc
+#   2) App 链接缺 libc++（BoringSSL 是 C++ 写的）                  → 补 -lc++
+#   3) Rust 侧部署目标与 SDK 不匹配                                → IPHONEOS_DEPLOYMENT_TARGET=15.0
 
 on:
   workflow_dispatch:
@@ -45,16 +48,26 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add aarch64-apple-ios
-          echo '--- 工具链版本 ---'
           cargo --version
           rustc --version
-          rustup target list --installed
 
-      - name: Export Rust env
+      - name: Export env and patch xcconfig
         run: |
           LIBCLANG="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib"
-          echo "LIBCLANG_PATH=$LIBCLANG" >> "$GITHUB_ENV"
-          echo "RUST_BACKTRACE=1" >> "$GITHUB_ENV"
+          {
+            echo "LIBCLANG_PATH=$LIBCLANG"
+            echo "RUST_BACKTRACE=1"
+            echo "IPHONEOS_DEPLOYMENT_TARGET=15.0"
+          } >> "$GITHUB_ENV"
+
+          for f in ios/Flutter/Release.xcconfig ios/Flutter/Debug.xcconfig ios/Flutter/Profile.xcconfig; do
+            if [ -f "$f" ] && ! grep -q 'lc++' "$f"; then
+              printf '\nOTHER_LDFLAGS = $(inherited) -lc++\n' >> "$f"
+              echo "patched $f"
+            fi
+          done
+          echo '--- Release.xcconfig ---'
+          cat ios/Flutter/Release.xcconfig
 
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
@@ -70,18 +83,15 @@ jobs:
       - name: flutter pub get
         run: flutter pub get
 
-      # 修复依赖漂移：libc 0.2.190 移除了 iOS 的 _dyld_* 绑定，backtrace 0.3.76 因此编不过
-      # 从一个较旧的版本往回找，取第一个能被 cargo 接受（满足所有约束）的版本
+      # 修复 1：libc 0.2.190 移除了 iOS 的 _dyld_* 绑定，backtrace 0.3.76 因此编不过
       - name: Pin libc for backtrace (workaround)
         run: |
           set -euo pipefail
           if [ ! -d rust ]; then echo '没有 rust 目录，跳过'; exit 0; fi
           cd rust
           if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
-
           echo '--- 修改前 ---'
           grep -A1 'name = "libc"' Cargo.lock | head -n 4 || true
-
           PINNED=""
           for v in 0.2.150 0.2.155 0.2.160 0.2.165 0.2.170 0.2.175 0.2.180 0.2.185 0.2.189; do
             if cargo update -p libc --precise "$v" >/dev/null 2>&1; then
@@ -89,13 +99,7 @@ jobs:
               break
             fi
           done
-
-          echo "--- 结果 ---"
-          if [ -n "$PINNED" ]; then
-            echo "libc 已钉到 $PINNED"
-          else
-            echo '全部版本都失败，保持原样'
-          fi
+          if [ -n "$PINNED" ]; then echo "libc 已钉到 $PINNED"; else echo '钉版本失败，保持原样'; fi
           grep -A1 'name = "libc"' Cargo.lock | head -n 4 || true
 
       - name: Prebuild Rust (diagnostic)
