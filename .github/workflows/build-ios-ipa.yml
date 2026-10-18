@@ -3,9 +3,9 @@ name: Build unsigned IPA (cloudflare bypass branch)
 # 构建上游 refactor/cloudflare_bypass 分支（Rust wreq 模拟 Chrome TLS 指纹，绕过 Cloudflare）
 #
 # 已修的上游问题：
-#   1) libc 0.2.190 删除 iOS 的 _dyld_* → backtrace 0.3.76 编不过  → 钉回旧版 libc
-#   2) App 链接缺 libc++（BoringSSL 是 C++ 写的）                  → 补 -lc++
-#   3) Rust 侧部署目标与 SDK 不匹配                                → IPHONEOS_DEPLOYMENT_TARGET=15.0
+#   1) libc 0.2.190 删除 iOS 的 _dyld_* → backtrace 0.3.76 编不过 → 钉回旧版 libc   [已生效]
+#   2) Rust 侧部署目标与 SDK 不匹配                                → IPHONEOS_DEPLOYMENT_TARGET   [已生效]
+#   3) App 链接缺 libc++（BoringSSL 是 C++）→ 改从 podspec 的 OTHER_LDFLAGS 注入 -lc++ [本版修复]
 
 on:
   workflow_dispatch:
@@ -37,6 +37,24 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version || true
 
+      # 修复 3：-force_load 能生效说明 pod_target_xcconfig 的 OTHER_LDFLAGS 会转发到 App 链接，
+      # 所以把 -lc++ 加在同一个字符串里（xcconfig 那条路会被 CocoaPods 覆盖）
+      - name: Patch podspec to link libc++
+        run: |
+          set -euo pipefail
+          PODSPEC="rust_builder/ios/hikari_http.podspec"
+          if [ ! -f "$PODSPEC" ]; then echo "找不到 $PODSPEC"; ls rust_builder/ios || true; exit 1; fi
+          echo '--- 修改前 ---'
+          grep -n 'OTHER_LDFLAGS' "$PODSPEC" || true
+          if ! grep -q 'lc++' "$PODSPEC"; then
+            sed -i '' "s|libhikari_http.a'|libhikari_http.a -lc++'|" "$PODSPEC"
+            echo '已注入 -lc++'
+          else
+            echo '已含 -lc++，跳过'
+          fi
+          echo '--- 修改后 ---'
+          grep -n 'OTHER_LDFLAGS' "$PODSPEC" || true
+
       - name: Install Rust + native deps
         run: |
           set -euo pipefail
@@ -51,7 +69,7 @@ jobs:
           cargo --version
           rustc --version
 
-      - name: Export env and patch xcconfig
+      - name: Export env
         run: |
           LIBCLANG="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib"
           {
@@ -59,15 +77,6 @@ jobs:
             echo "RUST_BACKTRACE=1"
             echo "IPHONEOS_DEPLOYMENT_TARGET=15.0"
           } >> "$GITHUB_ENV"
-
-          for f in ios/Flutter/Release.xcconfig ios/Flutter/Debug.xcconfig ios/Flutter/Profile.xcconfig; do
-            if [ -f "$f" ] && ! grep -q 'lc++' "$f"; then
-              printf '\nOTHER_LDFLAGS = $(inherited) -lc++\n' >> "$f"
-              echo "patched $f"
-            fi
-          done
-          echo '--- Release.xcconfig ---'
-          cat ios/Flutter/Release.xcconfig
 
       - name: Setup Flutter (latest stable)
         uses: subosito/flutter-action@v2
